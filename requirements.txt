@@ -1,0 +1,8 @@
+# requirements.txt
+opencv-python==4.5.5.64
+mtcnn==0.1.1
+deepface==0.0.79
+tensorflow-cpu==2.10.0
+numpy==1.23.5
+dotenv==0.9.9
+PyYAML

@@ -1,0 +1,3 @@
+local_data_output_folder: output_batches_actual_db_test
+local_dataset_root_path: D:\Sem6\PBL5\TestingModel\dataset_for_db_test
+mini_batch_size: 2
