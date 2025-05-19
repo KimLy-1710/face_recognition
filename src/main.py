@@ -2,225 +2,387 @@ from pathlib import Path
 import os
 import numpy as np
 import json
+import logging
+from typing import List, Dict, Any, Optional, Union
 from mtcnn import MTCNN
 from deepface import DeepFace
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 from src.configs.config import Config
 from src.data_uploading.upload_data_to_vectorDB import EmbeddingUploader
 
-# --- Configuration based on PDF and choices ---
-base_dir = Path(__file__).resolve().parent
-DATASET_PATH = base_dir / 'dataset/images'
 
-# Module 1: Face Detection
-FACE_DETECTOR_MTCNN = MTCNN()
-DETECTOR_BACKEND_DEEPFACE_ENROLL = "mtcnn"  # Detector for DeepFace during enrollment phase
+class FaceEnrollmentSystem:
+    """Face enrollment system that detects, extracts, and stores face embeddings"""
 
-# Module 4: Face Extraction
-FACE_EXTRACTION_MODEL = "ArcFace"
+    def __init__(self, config: Config):
+        """Initialize the face enrollment system with configuration
 
-# Module 6: Face Matching
-DISTANCE_METRIC = "cosine"  # Others: "euclidean", "euclidean_l2"
+        Args:
+            config: Configuration object containing system settings
+        """
+        self.config = config
+        self.logger = config.logger or self._setup_logger()
 
-# --- Global Variables for Known Faces Database ---
-known_face_embeddings_db = []
-known_face_names_db = []
+        # Base directory and dataset paths
+        self.base_dir = Path(__file__).resolve().parent
+        self.dataset_path = self.base_dir / 'dataset/images'
+        self.metadata_path = self.base_dir / 'dataset/metadata/metadata.json'
 
-# Add person metadata
-PERSON_METADATA = {}
+        # Face detection and recognition settings
+        self.face_detector = MTCNN()
+        self.detector_backend = "mtcnn"  # Detector for DeepFace during enrollment
+        self.extraction_model = "ArcFace"  # Can be: "VGG-Face", "Facenet", "OpenFace", "DeepFace", "ArcFace"
+        self.distance_metric = "cosine"  # Others: "euclidean", "euclidean_l2"
 
+        # Storage for enrolled faces
+        self.known_face_embeddings = []
+        self.known_face_names = []
+        self.person_metadata = {}
 
-def load_person_metadata():
-    """Load person metadata from JSON file"""
-    global PERSON_METADATA
-
-    # Define your JSON file path here
-    json_data = [
-        {"id": "01", "person_name": "Phuc", "birthday": "08/07/2004"},
-        {"id": "02", "person_name": "An", "birthday": "01/01/2004"}
-    ]
-
-    # Convert to dictionary for easy lookup by name
-    for person in json_data:
-        PERSON_METADATA[person["person_name"]] = {
-            "id": person["id"],
-            "birthday": person["birthday"]
+        # Metrics for logging
+        self.enrollment_stats = {
+            "total_images_processed": 0,
+            "successful_enrollments": 0,
+            "failed_enrollments": 0,
+            "unique_individuals": 0
         }
 
-    print(f"[INFO] Loaded metadata for {len(PERSON_METADATA)} persons")
+        # Maximum workers for parallel processing
+        self.max_workers = os.cpu_count() or 4
 
+        # Valid image extensions
+        self.valid_exts = {'.jpg', '.jpeg', '.png'}
 
-def enroll_faces_from_dataset(dataset_path):
-    global known_face_embeddings_db, known_face_names_db
-    known_face_embeddings_db = []
-    known_face_names_db = []
+    def _setup_logger(self) -> logging.Logger:
+        """Set up a logger if not provided in config
 
-    embeddings_for_db = []  # Store embeddings with metadata for DB upload
+        Returns:
+            Configured logger instance
+        """
+        logger = logging.getLogger("FaceEnrollment")
+        logger.setLevel(logging.INFO)
 
-    if not os.path.exists(dataset_path):
-        print(f"[ERROR] Dataset path {dataset_path} not found.")
-        return []
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
 
-    print(f"[INFO] Enrolling faces from {dataset_path} using {FACE_EXTRACTION_MODEL}...")
-    valid_exts = {'.jpg', '.jpeg', '.png'}
+        return logger
 
-    for person_name in os.listdir(dataset_path):
-        person_folder_path = Path(dataset_path) / person_name
-        if not person_folder_path.is_dir():
-            continue
+    def load_person_metadata(self, json_file_path: Optional[str] = None) -> Dict[str, Dict]:
+        """Load person metadata from JSON file
 
-        images_processed_for_person = 0
-        # Iterate through each file in the person's directory
-        for image_path in person_folder_path.iterdir():
-            if not image_path.is_file() or image_path.suffix.lower() not in valid_exts:
-                continue
+        Args:
+            json_file_path: Path to JSON file containing person metadata (optional)
 
-            print(f"\n[DEBUG] Processing enrollment image: {image_path}")
-            try:
-                # Pass the correct path as a string
-                embedding_objs = DeepFace.represent(
-                    img_path=str(image_path),
-                    model_name=FACE_EXTRACTION_MODEL,
-                    detector_backend=DETECTOR_BACKEND_DEEPFACE_ENROLL,
-                    enforce_detection=True,
-                    align=True
-                )
+        Returns:
+            Dictionary of person metadata keyed by person name
+        """
+        file_path = json_file_path or self.metadata_path
 
-                # Check the returned result
-                if (
-                        isinstance(embedding_objs, list) and
-                        len(embedding_objs) > 0 and
-                        isinstance(embedding_objs[0], dict) and
-                        'embedding' in embedding_objs[0]
-                ):
-                    embedding = embedding_objs[0]['embedding']
-
-                    # Get metadata for this person if available
-                    metadata = {}
-                    if person_name in PERSON_METADATA:
-                        metadata = PERSON_METADATA[person_name]
-
-                    # Create embedding object for vector DB
-                    embedding_object = {
-                        "person_name": person_name,
-                        "image_path": str(image_path),
-                        "embedding": embedding,
-                        "id": metadata.get("id", ""),
-                        "birthday": metadata.get("birthday", ""),
-                        "model": FACE_EXTRACTION_MODEL
-                    }
-
-                    # Add to our collection for vector DB upload
-                    embeddings_for_db.append(embedding_object)
-
-                    # Also maintain the original format for backward compatibility
-                    known_face_embeddings_db.append({
-                        "person_name": person_name,
-                        "embedded": embedding
-                    })
-                    known_face_names_db.append(person_name)
-
-                    images_processed_for_person += 1
-                    print(f"[INFO] Enrolled image for {person_name}: {image_path.name}")
-                else:
-                    print(f"[WARNING] No embedding for {image_path}")
-
-            except Exception as e:
-                print(f"[ERROR] Could not process {image_path}: {e}")
-
-        if images_processed_for_person > 0:
-            print(f"[INFO] Enrolled {images_processed_for_person} images for {person_name}")
-
-    if not embeddings_for_db:
-        print("[ERROR] No faces enrolled. Check dataset structure and image quality.")
-    else:
-        print(f"[INFO] Enrollment complete: {len(embeddings_for_db)} embeddings,"
-              f" {len(set(known_face_names_db))} individuals.")
-
-    return embeddings_for_db
-
-
-def upload_embeddings_to_vectordb(embeddings):
-    """Upload the embeddings to a vector database using EmbeddingUploader"""
-    config = Config()
-    uploader = EmbeddingUploader(config)
-
-    # Prepare data for batch upload
-    embedding_data = []
-
-    # Process each embedding for upload
-    for embedding_obj in embeddings:
         try:
-            # Convert numpy array to list if needed
-            if isinstance(embedding_obj["embedding"], np.ndarray):
-                embedding_obj["embedding"] = embedding_obj["embedding"].tolist()
+            # First try to load from file if it exists
+            if Path(file_path).exists():
+                with open(file_path, 'r') as f:
+                    json_data = json.load(f)
+                self.logger.info(f"Loaded metadata from {file_path}")
+            else:
+                # Fallback to hardcoded data
+                self.logger.warning(f"Metadata file {file_path} not found. Using fallback data.")
+                json_data = [
+                    {"id": "01", "person_name": "Phuc", "birthday": "08/07/2004"},
+                    {"id": "02", "person_name": "An", "birthday": "01/01/2004"}
+                ]
 
-            # Format the data according to your vector DB requirements
-            vector_data = {
-                "vector": embedding_obj["embedding"],
-                "metadata": {
-                    "person_name": embedding_obj["person_name"],
-                    "image_path": embedding_obj["image_path"],
-                    "id": embedding_obj["id"],
-                    "birthday": embedding_obj["birthday"],
-                    "model": embedding_obj["model"]
+            # Convert to dictionary for easy lookup by name
+            self.person_metadata = {
+                person["person_name"]: {
+                    "id": person.get("id", ""),
+                    "birthday": person.get("birthday", ""),
+                    **{k: v for k, v in person.items() if k not in ["id", "person_name", "birthday"]}
                 }
+                for person in json_data
             }
 
-            embedding_data.append(vector_data)
+            self.logger.info(f"Loaded metadata for {len(self.person_metadata)} persons")
+            return self.person_metadata
 
         except Exception as e:
-            print(f"[ERROR] Failed to process embedding for {embedding_obj['person_name']}: {e}")
+            self.logger.error(f"Failed to load metadata: {e}")
+            self.person_metadata = {}
+            return {}
 
-    try:
-        # Use the run() method of EmbeddingUploader to upload all embeddings at once
-        # This assumes the uploader class is designed to receive data through an attribute or method
-        uploader.embeddings = embedding_data  # Set the embeddings data
-        uploader.run()  # Run the upload process
-        print(f"[INFO] Uploaded {len(embeddings)} embeddings to vector database")
-    except Exception as e:
-        print(f"[ERROR] Failed to upload embeddings to vector database: {e}")
+    def process_single_image(self, image_path: Path, person_name: str) -> Optional[Dict]:
+        """Process a single image to extract face embedding
+
+        Args:
+            image_path: Path to the image file
+            person_name: Name of the person in the image
+
+        Returns:
+            Dictionary containing embedding data if successful, None otherwise
+        """
+        if not image_path.is_file() or image_path.suffix.lower() not in self.valid_exts:
+            return None
+
+        try:
+            # Pass the correct path as a string and handle exceptions properly
+            embedding_objs = DeepFace.represent(
+                img_path=str(image_path),
+                model_name=self.extraction_model,
+                detector_backend=self.detector_backend,
+                enforce_detection=True,
+                align=True
+            )
+
+            # Check if we got valid embeddings
+            if (isinstance(embedding_objs, list) and
+                    len(embedding_objs) > 0 and
+                    isinstance(embedding_objs[0], dict) and
+                    'embedding' in embedding_objs[0]):
+
+                embedding = embedding_objs[0]['embedding']
+
+                # Get metadata for this person if available
+                metadata = self.person_metadata.get(person_name, {})
+
+                # Create complete embedding object
+                embedding_object = {
+                    "person_name": person_name,
+                    "image_path": str(image_path),
+                    "embedding": embedding,
+                    "id": metadata.get("id", ""),
+                    "birthday": metadata.get("birthday", ""),
+                    "model": self.extraction_model,
+                    **{k: v for k, v in metadata.items() if k not in ["id", "birthday"]}
+                }
+
+                return embedding_object
+
+            else:
+                self.logger.warning(f"No valid embedding found in {image_path}")
+                return None
+
+        except Exception as e:
+            self.logger.error(f"Failed to process {image_path}: {str(e)}")
+            return None
+
+    def enroll_faces_from_dataset(self, dataset_path: Optional[Union[str, Path]] = None) -> List[Dict]:
+        """Enroll faces from the dataset
+
+        Args:
+            dataset_path: Path to the dataset directory (optional)
+
+        Returns:
+            List of embedding dictionaries for all successfully enrolled faces
+        """
+        path = Path(dataset_path) if dataset_path else self.dataset_path
+
+        if not path.exists():
+            self.logger.error(f"Dataset path {path} not found.")
+            return []
+
+        self.logger.info(f"Enrolling faces from {path} using {self.extraction_model}...")
+
+        # Reset storage
+        self.known_face_embeddings = []
+        self.known_face_names = []
+        embeddings_for_db = []
+
+        # Dictionary to track per-person statistics
+        person_stats = {}
+
+        # Get list of person folders
+        person_folders = [f for f in path.iterdir() if f.is_dir()]
+
+        for person_folder in person_folders:
+            person_name = person_folder.name
+            person_stats[person_name] = {"processed": 0, "successful": 0}
+
+            # Get all image files for this person
+            image_files = [
+                f for f in person_folder.iterdir()
+                if f.is_file() and f.suffix.lower() in self.valid_exts
+            ]
+
+            self.logger.info(f"Processing {len(image_files)} images for {person_name}")
+
+            # Process images in parallel
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all tasks
+                future_to_image = {
+                    executor.submit(self.process_single_image, img_path, person_name): img_path
+                    for img_path in image_files
+                }
+
+                # Process results as they complete
+                for future in tqdm(
+                        as_completed(future_to_image),
+                        total=len(future_to_image),
+                        desc=f"Enrolling {person_name}"
+                ):
+                    image_path = future_to_image[future]
+                    person_stats[person_name]["processed"] += 1
+                    self.enrollment_stats["total_images_processed"] += 1
+
+                    try:
+                        embedding_obj = future.result()
+
+                        if embedding_obj:
+                            # Add to collection for vector DB upload
+                            embeddings_for_db.append(embedding_obj)
+
+                            # Add to internal collections
+                            self.known_face_embeddings.append({
+                                "person_name": person_name,
+                                "embedded": embedding_obj["embedding"]
+                            })
+                            self.known_face_names.append(person_name)
+
+                            person_stats[person_name]["successful"] += 1
+                            self.enrollment_stats["successful_enrollments"] += 1
+
+                        else:
+                            self.enrollment_stats["failed_enrollments"] += 1
+
+                    except Exception as e:
+                        self.logger.error(f"Error retrieving result for {image_path}: {e}")
+                        self.enrollment_stats["failed_enrollments"] += 1
+
+        # Update unique individuals count
+        self.enrollment_stats["unique_individuals"] = len(set(self.known_face_names))
+
+        # Log per-person statistics
+        for person, stats in person_stats.items():
+            self.logger.info(
+                f"Enrolled {stats['successful']}/{stats['processed']} "
+                f"images for {person} ({stats['successful'] / max(stats['processed'], 1):.1%})"
+            )
+
+        if not embeddings_for_db:
+            self.logger.error("No faces enrolled. Check dataset structure and image quality.")
+        else:
+            self.logger.info(
+                f"Enrollment complete: {len(embeddings_for_db)} embeddings, "
+                f"{self.enrollment_stats['unique_individuals']} individuals."
+            )
+
+        return embeddings_for_db
+
+    def format_embeddings_for_db(self, embeddings: List[Dict]) -> List[Dict]:
+        """Format embeddings for vector database storage
+
+        Args:
+            embeddings: List of embedding dictionaries
+
+        Returns:
+            List of formatted embeddings ready for database upload
+        """
+        formatted_embeddings = []
+
+        for embedding_obj in embeddings:
+            try:
+                # Convert numpy array to list if needed
+                embedding_vector = embedding_obj["embedding"]
+                if isinstance(embedding_vector, np.ndarray):
+                    embedding_vector = embedding_vector.tolist()
+
+                # Format according to vector DB requirements
+                formatted_embedding = {
+                    "vector": embedding_vector,
+                    "metadata": {
+                        "person_name": embedding_obj["person_name"],
+                        "image_path": embedding_obj["image_path"],
+                        "id": embedding_obj.get("id", ""),
+                        "birthday": embedding_obj.get("birthday", ""),
+                        "model": embedding_obj.get("model", self.extraction_model)
+                    }
+                }
+
+                # Add any additional metadata fields
+                for key, value in embedding_obj.items():
+                    if key not in ["embedding", "person_name", "image_path", "id", "birthday", "model"]:
+                        formatted_embedding["metadata"][key] = value
+
+                formatted_embeddings.append(formatted_embedding)
+
+            except Exception as e:
+                self.logger.error(f"Failed to format embedding for {embedding_obj.get('person_name', 'unknown')}: {e}")
+
+        return formatted_embeddings
+
+    def upload_embeddings_to_vectordb(self, embeddings: List[Dict]) -> bool:
+        """Upload embeddings to vector database
+
+        Args:
+            embeddings: List of embedding dictionaries
+
+        Returns:
+            Boolean indicating success/failure
+        """
+        if not embeddings:
+            self.logger.warning("No embeddings to upload")
+            return False
+
+        try:
+            # Format embeddings for DB upload
+            formatted_embeddings = self.format_embeddings_for_db(embeddings)
+
+            # Create uploader instance
+            uploader = EmbeddingUploader(self.config)
+
+            # Store the formatted embeddings
+            uploader.embeddings = formatted_embeddings
+
+            # Run the upload process
+            uploader.run()
+
+            self.logger.info(f"Successfully uploaded {len(formatted_embeddings)} embeddings to vector database")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to upload embeddings to vector database: {e}")
+            return False
+
+    def run(self, dataset_path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
+        """Run the complete enrollment process
+
+        Args:
+            dataset_path: Path to dataset directory (optional)
+
+        Returns:
+            Dictionary containing enrollment statistics
+        """
+        # 1. Load person metadata
+        self.load_person_metadata()
+
+        # 2. Process images and get embeddings
+        embeddings = self.enroll_faces_from_dataset(dataset_path)
+
+        # 3. Upload embeddings to vector database
+        if embeddings:
+            self.upload_embeddings_to_vectordb(embeddings)
+
+        # 4. Log summary
+        self.logger.info("\nProcessing summary:")
+        self.logger.info(f"Total images processed: {self.enrollment_stats['total_images_processed']}")
+        self.logger.info(f"Successful enrollments: {self.enrollment_stats['successful_enrollments']}")
+        self.logger.info(f"Failed enrollments: {self.enrollment_stats['failed_enrollments']}")
+        self.logger.info(f"Unique individuals: {self.enrollment_stats['unique_individuals']}")
+
+        return self.enrollment_stats
 
 
 if __name__ == "__main__":
+    # Initialize with configuration
     config = Config()
 
-    # 1. Load person metadata from JSON
-    load_person_metadata()
+    # Create face enrollment system
+    enrollment_system = FaceEnrollmentSystem(config)
 
-    # 2. Process images and get embeddings with metadata
-    embeddings = enroll_faces_from_dataset(DATASET_PATH)
-
-    # 3. Properly format and store embeddings for database upload
-    formatted_embeddings = []
-    for embedding_obj in embeddings:
-        # Convert numpy array to list if needed
-        if isinstance(embedding_obj["embedding"], np.ndarray):
-            embedding_obj["embedding"] = embedding_obj["embedding"].tolist()
-
-        # Store the formatted embeddings
-        formatted_embeddings.append({
-            "vector": embedding_obj["embedding"],
-            "metadata": {
-                "person_name": embedding_obj["person_name"],
-                "image_path": embedding_obj["image_path"],
-                "id": embedding_obj["id"],
-                "birthday": embedding_obj["birthday"],
-                "model": embedding_obj["model"]
-            }
-        })
-
-    # 4. Upload embeddings to vector database using the original method
-    # This follows the pattern from the original code
-    config.logger.info("Starting embedding uploader...")
-    uploader = EmbeddingUploader(config)
-
-    # Store the formatted embeddings in the uploader object
-    # (assuming this is how the original code worked)
-    uploader.embeddings = formatted_embeddings
-
-    # Run the upload process
-    uploader.run()
-
-    config.logger.info("\nProcessing summary:")
-    config.logger.info(f"Total embeddings processed: {len(embeddings)}")
-    config.logger.info(f"Unique individuals: {len(set(known_face_names_db))}")
+    # Run the enrollment process
+    enrollment_system.run()
