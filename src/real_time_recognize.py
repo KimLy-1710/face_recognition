@@ -39,7 +39,7 @@ BASE_DIR = Path(__file__).resolve().parent
 VERBOSE_LOGGING = True  # Set to False to reduce console output
 
 # Camera
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 
@@ -56,10 +56,10 @@ DEEPSORT_NMS_MAX_OVERLAP = 1.0
 
 # Face Recognition (for DB matching)
 FACE_EXTRACTION_MODEL = "ArcFace"  # User specified: ArcFace (or SFace, etc.)
-FACE_DETECTOR_BACKEND = "mtcnn"  # User specified: ssd (or retinaface, mtcnn, etc.)
+FACE_DETECTOR_BACKEND = "ssd"  # User specified: ssd (or retinaface, mtcnn, etc.)
 FACE_DISTANCE_METRIC = "cosine"  # For comparing face embeddings
 UNKNOWN_STREAK_THRESHOLD = 3  # How many "Unknown" before sending DeepSORT feature
-FACE_RECOGNITION_THRESHOLD_MULTIPLIER = 0.65  # Adjust for desired strictness
+FACE_RECOGNITION_THRESHOLD_MULTIPLIER = 0.3  # Adjust for desired strictness
 MIN_FACE_ROI_SIZE = 30  # Minimum width/height of a person RoI to attempt face recognition
 
 # Database (for known faces)
@@ -519,7 +519,46 @@ def recognize_face_in_person_roi(person_roi_image: np.ndarray):
             print(f"Generic error during face recognition in RoI: {e}")
         return "ErrorInReco", None, face_roi_coords_relative  # Return partial info
 
+slave_sockets = []
+slave_lock = threading.Lock()
 
+def accept_slaves_thread():
+    while True:
+        try:
+            conn, addr = tcp_server_socket.accept()
+            print(f"🔗 New Slave connected from: {addr}")
+            with slave_lock:
+                slave_sockets.append(conn)
+        except Exception as e:
+            print(f"❌ Error accepting new slave connection: {e}")
+            break # Exit thread on major error
+threading.Thread(target=accept_slaves_thread, daemon=True).start()
+
+def send_feature_data_to_all(track_id_associated: str, feature: np.ndarray):
+    if feature is None or feature.size == 0:
+        print(f"⚠️ Attempted to send empty feature for ID {track_id_associated}. Aborting send.")
+        return
+
+    serialized_feature = feature.astype(np.float32).tobytes() # DeepSORT features are usually float32
+    # Prepend with track_id_associated (as a null-terminated string for easier parsing on slave)
+    # and then the length of the feature itself.
+    id_bytes = track_id_associated.encode('utf-8') + b'\x00' # Null-terminated string
+    feature_length_bytes = struct.pack(">I", len(serialized_feature)) # Length of feature only
+
+    payload = id_bytes + feature_length_bytes + serialized_feature
+
+    with slave_lock:
+        for sock_idx, sock in enumerate(list(slave_sockets)): # Iterate over a copy
+            try:
+                sock.sendall(payload)
+                # print(f"📤 Sent feature data (ID: {track_id_associated}, len: {len(serialized_feature)}) to slave {sock.getpeername()}")
+            except (BrokenPipeError, ConnectionResetError, socket.error) as e:
+                print(f"🔌 Slave {sock.getpeername()} disconnected or error: {e}. Removing.")
+                slave_sockets.pop(sock_idx) # Remove by index from original list
+                try: sock.close()
+                except: pass
+            except Exception as e:
+                print(f"❌ Failed to send to {sock.getpeername()}: {e}")
 # --- Main Processing Thread: YOLO, DeepSORT, and Face Recognition ---
 def yolo_deepsort_recognition_thread():
     global processed_frame_for_display_global, current_tracks_for_mouse_interaction
@@ -603,7 +642,23 @@ def yolo_deepsort_recognition_thread():
                 # ... (rest of the existing logic for unknown streak, feature sending) ...
                 if recognized_name == "Unknown":
                     current_status["unknown_streak"] += 1
-                    # ... (feature sending logic as before) ...
+                    current_status["name"] = "Unknown"
+                    if current_status["unknown_streak"] >= UNKNOWN_STREAK_THRESHOLD and \
+                            not current_status["feature_sent"]:
+
+                        if hasattr(track_obj, "features") and track_obj.features is not None and len(track_obj.features) > 0:
+                            deepsort_feature_vector = track_obj.features[-1]
+                            if deepsort_feature_vector is not None and deepsort_feature_vector.size > 0:
+                                print(
+                                    f"🕵️ Track ID {track_id_str} is '{recognized_name}' {current_status['unknown_streak']} times. Sending DeepSORT feature.")
+                                send_feature_data_to_all(track_id_str, deepsort_feature_vector)
+                                current_status["feature_sent"] = True  # Mark as sent
+                            else:
+                                print(
+                                    f"⚠️ Track ID {track_id_str} is '{recognized_name}', but no valid DeepSORT feature to send.")
+                        else:
+                            print(
+                                f"⚠️ Track ID {track_id_str} is '{recognized_name}', but no 'features' attribute or it's empty.")
                 elif recognized_name not in ["Processing...", "SmallRoI", "NoFaceInRoI", "BadFaceCrop",
                                              "ModelsNotReady", "ErrorInReco", "Unknown(NoDB)"]:
                     current_status["unknown_streak"] = 0
