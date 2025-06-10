@@ -57,12 +57,12 @@ DEEPSORT_NMS_MAX_OVERLAP = 1.0
 FACE_EXTRACTION_MODEL = "ArcFace"
 FACE_DETECTOR_BACKEND = "ssd"
 FACE_DISTANCE_METRIC = "cosine"
-UNKNOWN_STREAK_THRESHOLD = 3
-FACE_RECOGNITION_THRESHOLD_MULTIPLIER = 0.4
+UNKNOWN_STREAK_THRESHOLD = 15
+FACE_RECOGNITION_THRESHOLD_MULTIPLIER = 0.25
 MIN_FACE_ROI_SIZE = 30
 
 # Face Recognition Worker
-RECO_RETRY_INTERVAL_SECONDS = 3.0  # Time before retrying "Unknown"
+RECO_RETRY_INTERVAL_SECONDS = 1.0  # Time before retrying "Unknown"
 FACE_RECO_REQUEST_QUEUE_MAX_SIZE = 20  # Max outstanding reco requests
 FACE_RECO_RESULT_QUEUE_MAX_SIZE = 20  # Max unprocessed reco results
 
@@ -147,7 +147,7 @@ known_face_embeddings_db = []
 df_detector_for_recognition = None
 df_embedder_for_recognition = None
 df_embedder_target_size = None
-calculated_face_recognition_threshold = 0.4
+calculated_face_recognition_threshold = 0.3
 
 
 def get_deepface_model_expected_dimensions(model_name_str):
