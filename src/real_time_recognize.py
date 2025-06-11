@@ -62,7 +62,7 @@ FACE_RECOGNITION_THRESHOLD_MULTIPLIER = 0.25
 MIN_FACE_ROI_SIZE = 30
 
 # Face Recognition Worker
-RECO_RETRY_INTERVAL_SECONDS = 1.0  # Time before retrying "Unknown"
+RECO_RETRY_INTERVAL_SECONDS = 0.5  # Time before retrying "Unknown"
 FACE_RECO_REQUEST_QUEUE_MAX_SIZE = 20  # Max outstanding reco requests
 FACE_RECO_RESULT_QUEUE_MAX_SIZE = 20  # Max unprocessed reco results
 
@@ -403,22 +403,42 @@ def handle_mouse_click_for_selection(event, x_coord, y_coord, flags, params):
 
 
 # --- Face Recognition Helper for RoIs ---
+# --- Face Recognition Helper for RoIs ---
 def recognize_face_in_person_roi(person_roi_image: np.ndarray):
     if person_roi_image is None or person_roi_image.size < (MIN_FACE_ROI_SIZE * MIN_FACE_ROI_SIZE * 3):
         return "SmallRoI", None, None
     if not df_embedder_for_recognition:
         return "ModelsNotReady", None, None
+
     face_roi_coords_relative = None
     try:
         extracted_faces_data = DeepFace.extract_faces(
-            img_path=person_roi_image.copy(), target_size=df_embedder_target_size,
-            detector_backend=FACE_DETECTOR_BACKEND, enforce_detection=False, align=True
+            img_path=person_roi_image.copy(),
+            target_size=df_embedder_target_size,
+            detector_backend=FACE_DETECTOR_BACKEND,
+            enforce_detection=True,  # Assuming you want to keep this True
+            align=True
         )
-        if not extracted_faces_data or not extracted_faces_data[0]['face'].size > 0:
-            return "NoFaceInRoI", None, None
+
+        # --- MODIFIED SECTION ---
+        if not extracted_faces_data:  # Check if the list is empty first
+            if VERBOSE_LOGGING:
+                print(f"[FaceRecoWorker] No face detected in RoI with enforce_detection=True.")
+            return "NoFaceInRoI", None, None # Correctly return NoFaceInRoI
+
+        # Now we know extracted_faces_data is not empty, proceed to check the first face
+        # It's also good practice to ensure the 'face' key exists and its value is valid,
+        # though DeepFace usually guarantees this if the list isn't empty.
         first_face_data = extracted_faces_data[0]
+        if 'face' not in first_face_data or not isinstance(first_face_data['face'], np.ndarray) or first_face_data['face'].size == 0:
+            if VERBOSE_LOGGING:
+                print(f"[FaceRecoWorker] Face data malformed or empty face array for first detected face.")
+            return "BadFaceCrop", None, first_face_data.get('facial_area') # Return coords if available
+        # --- END MODIFIED SECTION ---
+
         face_chip_np = first_face_data['face']
-        face_roi_coords_relative = first_face_data['facial_area']
+        face_roi_coords_relative = first_face_data['facial_area'] # Should exist if face was found
+
         if face_chip_np.ndim == 3:
             face_chip_batch = np.expand_dims(face_chip_np, axis=0)
         elif face_chip_np.ndim == 4 and face_chip_np.shape[0] == 1:
@@ -426,28 +446,40 @@ def recognize_face_in_person_roi(person_roi_image: np.ndarray):
         else:
             if VERBOSE_LOGGING: print(f"Unexpected face_chip_np shape: {face_chip_np.shape}")
             return "BadFaceCrop", None, face_roi_coords_relative
+
         embedding_vector = df_embedder_for_recognition.predict(face_chip_batch)[0]
+
         if not known_face_embeddings_db:
             return "Unknown(NoDB)", embedding_vector, face_roi_coords_relative
+
         min_similarity_distance = float('inf')
         final_recognized_name = "Unknown"
+
         for known_person_data in known_face_embeddings_db:
             db_embedding = known_person_data["embedding"]
             current_distance = df_dst_functions.findCosineDistance(embedding_vector, db_embedding) \
                 if FACE_DISTANCE_METRIC == "cosine" else \
-                df_dst_functions.findEuclideanDistance(df_dst_functions.l2_normalize(embedding_vector),
-                                                       df_dst_functions.l2_normalize(db_embedding))
+                df_dst_functions.findEuclideanDistance(
+                    df_dst_functions.l2_normalize(embedding_vector),
+                    df_dst_functions.l2_normalize(db_embedding)
+                )
+
             if current_distance < min_similarity_distance:
                 min_similarity_distance = current_distance
                 if min_similarity_distance < calculated_face_recognition_threshold:
                     final_recognized_name = known_person_data["person_name"]
+
         return final_recognized_name, embedding_vector, face_roi_coords_relative
-    except ValueError as ve:
-        if VERBOSE_LOGGING: print(f"ValueError during face recognition in RoI: {ve}")
+
+    except ValueError as ve: # This specifically catches errors from numpy/tensorflow about shapes
+        if VERBOSE_LOGGING:
+            print(f"ValueError during face recognition in RoI (likely shape mismatch for embedding): {ve}")
+            # traceback.print_exc() # Optional: for more details on ValueError
         return "ErrorInRecoShape", None, face_roi_coords_relative
-    except Exception as e:
-        if VERBOSE_LOGGING: print(f"Generic error during face recognition in RoI: {e}")
-        traceback.print_exc()  # Print full traceback for worker thread errors
+    except Exception as e: # Catches other errors like potential issues in DeepFace or unexpected problems
+        if VERBOSE_LOGGING:
+            print(f"Generic error during face recognition in RoI: {e}")
+            traceback.print_exc() # Good to have full traceback for these
         return "ErrorInReco", None, face_roi_coords_relative
 
 
@@ -613,7 +645,7 @@ def yolo_deepsort_recognition_thread():
             if str(track_obj.track_id) == str(selected_track_id_by_click):
                 display_color = (0, 255, 255)
             elif name_for_logic not in ["Unknown", "Processing...", "SmallRoI", "NoFaceInRoI", "BadFaceCrop",
-                                        "ModelsNotReady", "ErrorInReco", "Unknown(NoDB)",
+                                        "ModelsNotReady", "ErrorInReco", "Unknown(NoDB)", "ErrorInRecoShape"
                                         "PendingInitialReco", "Identifying..."]:
                 display_color = (0, 255, 0)
 
