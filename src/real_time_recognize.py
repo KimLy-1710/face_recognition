@@ -55,14 +55,14 @@ DEEPSORT_NMS_MAX_OVERLAP = 1.0
 
 # Face Recognition (for DB matching)
 FACE_EXTRACTION_MODEL = "ArcFace"
-FACE_DETECTOR_BACKEND = "ssd"
+FACE_DETECTOR_BACKEND = "mtcnn"
 FACE_DISTANCE_METRIC = "cosine"
 UNKNOWN_STREAK_THRESHOLD = 15
 FACE_RECOGNITION_THRESHOLD_MULTIPLIER = 0.25
 MIN_FACE_ROI_SIZE = 30
 
 # Face Recognition Worker
-RECO_RETRY_INTERVAL_SECONDS = 0.03  # Time before retrying "Unknown"
+RECO_RETRY_INTERVAL_SECONDS = 0.05 # Time before retrying "Unknown"
 FACE_RECO_REQUEST_QUEUE_MAX_SIZE = 20  # Max outstanding reco requests
 FACE_RECO_RESULT_QUEUE_MAX_SIZE = 20  # Max unprocessed reco results
 
@@ -599,7 +599,8 @@ def yolo_deepsort_recognition_thread():
                 if not current_status["recognition_pending"]:
                     if current_status["name"] == "PendingInitialReco":
                         should_request_reco_flag = True
-                    elif current_status["name"] == "Unknown" and \
+                    elif current_status["name"] in ["Unknown", "SmallRoI", "NoFaceInRoI", "BadFaceCrop",
+                                        "ModelsNotReady", "ErrorInReco", "Unknown(NoDB)", "ErrorInRecoShape"] and \
                             (time.time() - current_status["last_reco_request_time"]) > RECO_RETRY_INTERVAL_SECONDS:
                         should_request_reco_flag = True
 
@@ -682,11 +683,11 @@ def yolo_deepsort_recognition_thread():
 async def video_stream_endpoint():
     async def frame_generator_for_stream():
         while True:
-            frame_processed_event.wait();
+            frame_processed_event.wait()
             frame_processed_event.clear()
             with processed_frame_lock:
                 if processed_frame_for_display_global is None:
-                    await asyncio.sleep(0.01);
+                    await asyncio.sleep(0.01)
                     continue
                 frame_to_stream = processed_frame_for_display_global.copy()
             resized_stream_frame = cv2.resize(frame_to_stream, (STREAMING_WIDTH, STREAMING_HEIGHT),
