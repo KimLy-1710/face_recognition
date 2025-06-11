@@ -62,7 +62,7 @@ FACE_RECOGNITION_THRESHOLD_MULTIPLIER = 0.25
 MIN_FACE_ROI_SIZE = 30
 
 # Face Recognition Worker
-RECO_RETRY_INTERVAL_SECONDS = 0.5  # Time before retrying "Unknown"
+RECO_RETRY_INTERVAL_SECONDS = 0.03  # Time before retrying "Unknown"
 FACE_RECO_REQUEST_QUEUE_MAX_SIZE = 20  # Max outstanding reco requests
 FACE_RECO_RESULT_QUEUE_MAX_SIZE = 20  # Max unprocessed reco results
 
@@ -405,7 +405,7 @@ def handle_mouse_click_for_selection(event, x_coord, y_coord, flags, params):
 # --- Face Recognition Helper for RoIs ---
 # --- Face Recognition Helper for RoIs ---
 def recognize_face_in_person_roi(person_roi_image: np.ndarray):
-    if person_roi_image is None or person_roi_image.size < (MIN_FACE_ROI_SIZE * MIN_FACE_ROI_SIZE * 3):
+    if person_roi_image is None or person_roi_image.size < (MIN_FACE_ROI_SIZE * MIN_FACE_ROI_SIZE ):
         return "SmallRoI", None, None
     if not df_embedder_for_recognition:
         return "ModelsNotReady", None, None
@@ -618,7 +618,7 @@ def yolo_deepsort_recognition_thread():
                         if VERBOSE_LOGGING: print(f"[WARNING] Face reco request queue full for track {track_id_str}.")
                 else:
                     with track_recognition_state_lock:
-                        current_status["name"] = "SmallRoI";
+                        current_status["name"] = "SmallRoI"
                         current_status["recognition_pending"] = False
                         current_status["relative_face_coords"] = None
 
@@ -645,7 +645,7 @@ def yolo_deepsort_recognition_thread():
             if str(track_obj.track_id) == str(selected_track_id_by_click):
                 display_color = (0, 255, 255)
             elif name_for_logic not in ["Unknown", "Processing...", "SmallRoI", "NoFaceInRoI", "BadFaceCrop",
-                                        "ModelsNotReady", "ErrorInReco", "Unknown(NoDB)", "ErrorInRecoShape"
+                                        "ModelsNotReady", "ErrorInReco", "Unknown(NoDB)", "ErrorInRecoShape",
                                         "PendingInitialReco", "Identifying..."]:
                 display_color = (0, 255, 0)
 
